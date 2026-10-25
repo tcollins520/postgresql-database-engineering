@@ -20,7 +20,6 @@
 #   - An incremental backup is not a standalone restore image.
 #   - To prepare a complete backup for restore, use pg_combinebackup with the
 #     full backup and every incremental in order, then verify the combined output.
-#   - Test the complete restore process before relying on scheduled backups.
 #
 set -Eeuo pipefail
 umask 077

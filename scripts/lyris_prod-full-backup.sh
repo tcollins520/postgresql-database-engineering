@@ -18,7 +18,6 @@
 # Safety notes:
 #   - It does not delete older backups or backup chains.
 #   - It does not configure cron, PostgreSQL, WAL archiving, or TLS.
-#   - Test the backup and a restore procedure before relying on it in production.
 #
 set -Eeuo pipefail
 umask 077
