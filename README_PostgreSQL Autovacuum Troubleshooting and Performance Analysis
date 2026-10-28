@@ -1,0 +1,1022 @@
+# PostgreSQL Autovacuum Troubleshooting and Performance Analysis
+
+## Project Overview
+
+This project demonstrates practical PostgreSQL DBA skills using PostgreSQL 18.6 on CentOS Stream 9.
+
+The objective was to understand how PostgreSQL manages dead tuples, how autovacuum thresholds are calculated, how to monitor automatic maintenance, and how to interpret table statistics during a controlled troubleshooting exercise.
+
+The work was performed in a dedicated database named `vacuum_practice`, using the table `public.vacuum_demo`.
+
+### Objectives
+
+- Create and populate a practice table.
+- Generate row updates and deletions to observe PostgreSQL's MVCC behavior.
+- Perform manual `VACUUM` and `ANALYZE`.
+- Inspect table statistics and index usage.
+- Compare sequential scans, bitmap scans, and index scans.
+- Review PostgreSQL's global autovacuum settings.
+- Configure and verify temporary table-level autovacuum settings.
+- Calculate the approximate autovacuum vacuum threshold.
+- Observe automatic vacuum and autoanalyze activity.
+- Check for active vacuum workers.
+- Review transaction ID age and potential blockers to vacuum cleanup.
+- Document the queries and output patterns a DBA should investigate during production troubleshooting.
+
+## Environment and Scope
+
+| Item | Value |
+|---|---|
+| PostgreSQL version | 18.6 |
+| Operating system | CentOS Stream 9 |
+| Database | `vacuum_practice` |
+| Schema | `public` |
+| Practice table | `vacuum_demo` |
+| Primary key | `id` |
+| Initial row count | 10,000 |
+| Final observed live-row estimate | 8,000 |
+| Final observed dead-tuple estimate | 0 |
+| Manual vacuum count | 1 |
+| Autovacuum count | 5 |
+
+**Scope restriction:** All data modifications in this exercise target `vacuum_practice.public.vacuum_demo`. Do not run these practice updates or deletes against `lyris_prod`.
+
+---
+
+## Phase 1 — Create the Practice Database and Table
+
+### 1.1 Connect to PostgreSQL
+
+Connect to the PostgreSQL primary using the normal administrative connection method.
+
+From a shell, a local connection as the `postgres` operating-system user can be made with:
+
+```bash
+sudo -iu postgres psql
+```
+
+Create the dedicated practice database if it does not already exist:
+
+```sql
+CREATE DATABASE vacuum_practice;
+```
+
+Connect to it:
+
+```sql
+\c vacuum_practice
+```
+
+Verify the connection:
+
+```sql
+SELECT current_database(), current_user, version();
+```
+
+**What to look for:**
+
+- `current_database()` should return `vacuum_practice`.
+- `current_user` should show the PostgreSQL role you are using.
+- `version()` should identify the PostgreSQL server version.
+
+Do not recreate the database if it already exists and contains the work you want to preserve.
+
+### 1.2 Create the table
+
+The table structure used in the exercise was:
+
+```sql
+CREATE TABLE public.vacuum_demo (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_name VARCHAR(100) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    amount NUMERIC(10,2) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Inspect the table:
+
+```sql
+\d+ public.vacuum_demo
+```
+
+**What to look for:**
+
+- `id` is an identity column and primary key.
+- `customer_name`, `status`, and `amount` are required.
+- `created_at` receives a timestamp by default.
+- PostgreSQL creates a primary-key index automatically.
+
+### 1.3 Populate the table
+
+The exercise began with 10,000 generated rows. The following is a reproducible example of the initial data load; it creates representative practice data without requiring an external data file.
+
+```sql
+INSERT INTO public.vacuum_demo (
+    customer_name,
+    status,
+    amount
+)
+SELECT
+    'Customer ' || g,
+    CASE
+        WHEN g % 3 = 0 THEN 'PENDING'
+        WHEN g % 3 = 1 THEN 'COMPLETED'
+        ELSE 'CANCELLED'
+    END,
+    ROUND((100 + random() * 900)::numeric, 2)
+FROM generate_series(1, 10000) AS g;
+```
+
+Expected output:
+
+```text
+INSERT 0 10000
+```
+
+Verify the number of rows:
+
+```sql
+SELECT COUNT(*) AS total_rows
+FROM public.vacuum_demo;
+```
+
+Expected result:
+
+```text
+ total_rows
+------------
+      10000
+```
+
+Check the distribution of statuses:
+
+```sql
+SELECT status, COUNT(*) AS row_count
+FROM public.vacuum_demo
+GROUP BY status
+ORDER BY status;
+```
+
+**What to look for:** Each status should have approximately one-third of the rows in this reproducible example. The exact original random `amount` values are not reconstructed by the example.
+
+---
+
+## Phase 2 — Generate Updates and Deletes
+
+PostgreSQL uses multiversion concurrency control (MVCC). An `UPDATE` normally creates a new row version rather than overwriting the existing version in place. A `DELETE` marks a row version as deleted. Once an old version is no longer needed by any transaction, it can be eligible for cleanup by vacuum.
+
+### 2.1 Update 3,000 rows
+
+```sql
+UPDATE vacuum_demo
+SET status = 'PROCESSING'
+WHERE id <= 3000;
+```
+
+Observed output:
+
+```text
+UPDATE 3000
+```
+
+Verify the changed rows:
+
+```sql
+SELECT COUNT(*) AS processing_rows
+FROM vacuum_demo
+WHERE status = 'PROCESSING';
+```
+
+**What to look for:** The query should show how many rows currently have the `PROCESSING` status. Because statuses were assigned during the initial load, use the count rather than assuming the total is exactly 3,000.
+
+### 2.2 Delete 2,000 rows
+
+```sql
+DELETE FROM vacuum_demo
+WHERE id BETWEEN 3001 AND 5000;
+```
+
+Observed output:
+
+```text
+DELETE 2000
+```
+
+Check the current row count:
+
+```sql
+SELECT COUNT(*) AS total_rows
+FROM vacuum_demo;
+```
+
+The expected logical row count after this deletion is 8,000.
+
+**What to look for:** `COUNT(*)` returns rows visible to the current transaction. It does not count obsolete row versions still occupying storage.
+
+### 2.3 Inspect table statistics
+
+```sql
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze,
+    vacuum_count,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE schemaname = 'public'
+  AND relname = 'vacuum_demo';
+```
+
+**What to look for:**
+
+| Column | Meaning |
+|---|---|
+| `n_live_tup` | Estimated live tuple count |
+| `n_dead_tup` | Estimated dead tuple count |
+| `n_mod_since_analyze` | Estimated modifications since the last analyze |
+| `last_vacuum` | Last manual vacuum timestamp |
+| `last_autovacuum` | Last automatic vacuum timestamp |
+| `last_analyze` | Last manual analyze timestamp |
+| `last_autoanalyze` | Last automatic analyze timestamp |
+| `vacuum_count` | Number of manual vacuum operations recorded |
+| `autovacuum_count` | Number of automatic vacuum operations recorded |
+
+These are statistics, not an exact transactional ledger. They may lag behind recent activity.
+
+---
+
+## Phase 3 — Perform Manual Vacuum and Analyze
+
+### 3.1 Run verbose vacuum
+
+```sql
+VACUUM (ANALYZE, VERBOSE) vacuum_demo;
+```
+
+This command performs vacuum cleanup and refreshes planner statistics.
+
+Observed output included:
+
+```text
+tuples: 0 removed, 4934 remain, 0 are dead but not yet removable
+```
+
+The verbose output reports information about the vacuum operation and storage pages. The exact output varies with table contents, PostgreSQL version, and maintenance activity.
+
+**What to look for:**
+
+- Whether dead tuples were removed.
+- Whether dead tuples were not removable because they were still potentially visible to a transaction.
+- Whether index cleanup occurred.
+- Whether PostgreSQL completed the operation without errors.
+- Whether analyze statistics were updated.
+
+A reported zero dead tuples after vacuum does not mean the table never had dead tuples. It reflects the statistics and cleanup state observed by the operation.
+
+### 3.2 Check row count and statistics again
+
+```sql
+SELECT COUNT(*) AS visible_rows
+FROM vacuum_demo;
+```
+
+Then:
+
+```sql
+SELECT
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze
+FROM pg_stat_user_tables
+WHERE schemaname = 'public'
+  AND relname = 'vacuum_demo';
+```
+
+**What to look for:** The visible row count should be 8,000 after the initial deletion. The tuple statistics may differ slightly because they are estimates.
+
+---
+
+## Phase 4 — Index Creation and Query Plan Analysis
+
+This phase examined how indexes affect query plans. It also demonstrated why adding an index does not automatically make every query faster.
+
+### 4.1 Create a status index
+
+```sql
+CREATE INDEX idx_vacuum_demo_status
+ON vacuum_demo (status);
+```
+
+### 4.2 Create a composite index
+
+```sql
+CREATE INDEX idx_vacuum_demo_status_id
+ON vacuum_demo (status, id);
+```
+
+The composite index places `status` first and `id` second. This can help queries that filter by status and then by an ID range.
+
+### 4.3 Compare a status query
+
+Run:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM vacuum_demo
+WHERE status = 'COMPLETED';
+```
+
+The exercise showed a sequential scan before the index was introduced and a bitmap heap scan in a later run using the status index. Example execution times observed were approximately 0.379 ms and 0.716 ms, respectively.
+
+**What to look for:**
+
+- `Seq Scan`: PostgreSQL reads the table directly.
+- `Bitmap Index Scan`: PostgreSQL finds matching index entries.
+- `Bitmap Heap Scan`: PostgreSQL fetches matching table pages using the bitmap.
+- `actual time`: Observed execution timing.
+- `rows`: Actual row count returned at each plan node.
+- `Buffers`: Buffer activity associated with the operation.
+
+These timings are individual measurements, not a controlled benchmark. Cache state, data distribution, and execution conditions can affect the result. A sequential scan can be the correct choice when a query returns a large proportion of the table.
+
+### 4.4 Test the composite index
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM vacuum_demo
+WHERE status = 'PROCESSING'
+  AND id BETWEEN 1000 AND 2000;
+```
+
+The composite index `idx_vacuum_demo_status_id` was used in the exercise. The query returned 1,001 rows while the planner estimated approximately 375 rows. An execution time of approximately 0.193 ms was observed in a later run.
+
+**What to look for:**
+
+- Whether PostgreSQL uses `idx_vacuum_demo_status_id`.
+- Whether the estimated row count differs substantially from the actual row count.
+- Whether the index condition includes both status and ID.
+- Whether the query returns many rows relative to the table size.
+
+A large estimate-versus-actual discrepancy can indicate a need to investigate statistics, data distribution, and correlation. It does not automatically mean the index is wrong.
+
+### 4.5 Test a narrow range
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM vacuum_demo
+WHERE status = 'PROCESSING'
+  AND id BETWEEN 1000 AND 1010;
+```
+
+This narrow-range query used an index scan on the composite index and returned 11 rows.
+
+**Lesson:** Index usefulness depends on the predicates and number of matching rows. The leading column of a composite index matters.
+
+### 4.6 Test the primary-key index
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM vacuum_demo
+WHERE id BETWEEN 7500 AND 7510;
+```
+
+This query used the primary-key index through a bitmap-based plan in the observed run.
+
+**Lesson:** PostgreSQL can choose different scan strategies for different predicates, even on the same table.
+
+### 4.7 Refresh planner statistics
+
+```sql
+ANALYZE vacuum_demo;
+```
+
+Expected output:
+
+```text
+ANALYZE
+```
+
+Repeat the relevant `EXPLAIN (ANALYZE, BUFFERS)` queries to see whether the estimated row counts or plan choices change.
+
+**Important:** `ANALYZE` updates planner statistics. It does not perform the dead-tuple cleanup provided by `VACUUM`.
+
+---
+
+## Phase 5 — Inspect Global Autovacuum Settings
+
+We queried the effective global settings using `pg_settings`.
+
+```sql
+SELECT
+    name,
+    setting,
+    unit,
+    source
+FROM pg_settings
+WHERE name IN (
+    'autovacuum',
+    'autovacuum_analyze_scale_factor',
+    'autovacuum_analyze_threshold',
+    'autovacuum_max_workers',
+    'autovacuum_naptime',
+    'autovacuum_vacuum_cost_delay',
+    'autovacuum_vacuum_cost_limit',
+    'autovacuum_vacuum_scale_factor',
+    'autovacuum_vacuum_threshold'
+)
+ORDER BY name;
+```
+
+The global settings observed were:
+
+| Setting | Value | Meaning |
+|---|---:|---|
+| `autovacuum` | `on` | Automatic maintenance enabled |
+| `autovacuum_analyze_scale_factor` | `0.1` | Analyze threshold scale factor |
+| `autovacuum_analyze_threshold` | `50` | Base analyze threshold |
+| `autovacuum_max_workers` | `3` | Maximum concurrent autovacuum workers |
+| `autovacuum_naptime` | `60` seconds | Launcher sleep interval between scheduling cycles |
+| `autovacuum_vacuum_cost_delay` | `2` ms | Vacuum cost delay |
+| `autovacuum_vacuum_cost_limit` | `-1` | Use the applicable inherited/default cost limit |
+| `autovacuum_vacuum_scale_factor` | `0.2` | Vacuum threshold scale factor |
+| `autovacuum_vacuum_threshold` | `50` | Base vacuum threshold |
+
+The `source` column identifies where PostgreSQL obtained a setting, such as a default or configuration file.
+
+**What to look for:**
+
+- `autovacuum = on` is necessary for normal automatic maintenance.
+- A high scale factor can mean a large table needs many modifications before ordinary vacuum becomes eligible.
+- A limited number of workers can delay maintenance when many tables need attention.
+- Cost settings affect maintenance pacing.
+- The analyze threshold is separate from the vacuum threshold.
+
+---
+
+## Phase 6 — Apply Temporary Table-Level Autovacuum Settings
+
+To demonstrate table-specific tuning, we temporarily lowered the vacuum threshold for `vacuum_demo`.
+
+### 6.1 Configure the table
+
+```sql
+ALTER TABLE vacuum_demo SET (
+    autovacuum_vacuum_threshold = 50,
+    autovacuum_vacuum_scale_factor = 0.05
+);
+```
+
+Verify the stored options:
+
+```sql
+SELECT
+    c.relname,
+    c.reloptions
+FROM pg_class AS c
+JOIN pg_namespace AS n
+    ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname = 'vacuum_demo';
+```
+
+**What to look for:** The `reloptions` output should contain the two table-level autovacuum overrides.
+
+### 6.2 Generate 500 updates
+
+```sql
+UPDATE vacuum_demo
+SET amount = amount + 1
+WHERE id BETWEEN 5001 AND 5500;
+```
+
+Observed output:
+
+```text
+UPDATE 500
+```
+
+Inspect the statistics:
+
+```sql
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'vacuum_demo';
+```
+
+The subsequent observed values included:
+
+- `n_live_tup = 7830`
+- `n_dead_tup = 0`
+- `n_mod_since_analyze = 500`
+- `autovacuum_count = 4`
+
+The table's row and modification statistics are estimates and can be affected by maintenance occurring between commands.
+
+### 6.3 Calculate the table-level vacuum threshold
+
+With approximately 8,000 live rows and the temporary settings:
+
+- Base threshold: 50
+- Scale factor: 0.05
+
+The approximate threshold is:
+
+```text
+50 + (8000 × 0.05) = 450
+```
+
+The 500-row update exceeded this approximate threshold, and a later statistics check recorded an additional autovacuum run.
+
+**Important distinction:** The threshold determines when vacuum becomes eligible based on PostgreSQL's estimates. It does not guarantee an immediate start or prove that a specific update alone triggered the run.
+
+---
+
+## Phase 7 — Restore the Global Settings
+
+After the demonstration, we removed the table-specific overrides.
+
+```sql
+ALTER TABLE vacuum_demo RESET (
+    autovacuum_vacuum_threshold,
+    autovacuum_vacuum_scale_factor
+);
+```
+
+Expected output:
+
+```text
+ALTER TABLE
+```
+
+Verify that the overrides are gone:
+
+```sql
+SELECT
+    c.relname,
+    c.reloptions
+FROM pg_class AS c
+JOIN pg_namespace AS n
+    ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname = 'vacuum_demo';
+```
+
+Observed result: `reloptions` was empty.
+
+**Lesson:** An empty `reloptions` value means the table has no stored per-table options for this purpose and inherits the applicable global defaults.
+
+---
+
+## Phase 8 — Production-Style Autovacuum Troubleshooting
+
+We then ran a controlled exercise using the global default vacuum settings.
+
+### 8.1 Record the baseline
+
+```sql
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'vacuum_demo';
+```
+
+Baseline observed:
+
+```text
+n_live_tup          | 7830
+n_dead_tup          | 0
+n_mod_since_analyze | 500
+last_autovacuum     | 2026-10-28 19:11:58.848512+00
+autovacuum_count    | 4
+```
+
+### 8.2 Update 1,000 rows
+
+```sql
+UPDATE vacuum_demo
+SET amount = amount + 1
+WHERE id BETWEEN 6001 AND 7000;
+```
+
+Observed output:
+
+```text
+UPDATE 1000
+```
+
+Inspect the statistics:
+
+```sql
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'vacuum_demo';
+```
+
+Observed output included:
+
+```text
+n_live_tup          | 8000
+n_dead_tup          | 1000
+n_mod_since_analyze | 0
+autovacuum_count    | 4
+```
+
+The estimated dead-tuple count increased to 1,000. The `n_mod_since_analyze` counter reset, likely due to statistics being refreshed by analyze activity. It is not a dead-tuple count.
+
+### 8.3 Verify the effective vacuum threshold
+
+```sql
+SELECT
+    c.relname,
+    c.reltuples::bigint AS estimated_rows,
+    current_setting('autovacuum_vacuum_threshold') AS global_threshold,
+    current_setting('autovacuum_vacuum_scale_factor') AS global_scale_factor,
+    COALESCE(
+        (
+            SELECT option_value
+            FROM pg_options_to_table(c.reloptions)
+            WHERE option_name = 'autovacuum_vacuum_threshold'
+        ),
+        current_setting('autovacuum_vacuum_threshold')
+    ) AS effective_threshold,
+    COALESCE(
+        (
+            SELECT option_value
+            FROM pg_options_to_table(c.reloptions)
+            WHERE option_name = 'autovacuum_vacuum_scale_factor'
+        ),
+        current_setting('autovacuum_vacuum_scale_factor')
+    ) AS effective_scale_factor
+FROM pg_class AS c
+JOIN pg_namespace AS n
+    ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname = 'vacuum_demo';
+```
+
+Observed values:
+
+```text
+estimated_rows          | 8000
+global_threshold        | 50
+global_scale_factor     | 0.2
+effective_threshold     | 50
+effective_scale_factor  | 0.2
+```
+
+The approximate trigger was:
+
+```text
+50 + (8000 × 0.20) = 1650
+```
+
+The estimated 1,000 dead tuples were below this approximate threshold, so no new autovacuum had yet been recorded in that check.
+
+### 8.4 Check statistics again
+
+```sql
+SELECT
+    clock_timestamp() AS checked_at,
+    n_live_tup,
+    n_dead_tup,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'vacuum_demo';
+```
+
+At `2026-10-28 19:25:15.686875+00`, the result still showed:
+
+```text
+n_live_tup       | 8000
+n_dead_tup       | 1000
+autovacuum_count | 4
+```
+
+### 8.5 Update another 1,000 rows
+
+```sql
+UPDATE vacuum_demo
+SET amount = amount + 1
+WHERE id BETWEEN 7001 AND 8000;
+```
+
+Observed output:
+
+```text
+UPDATE 1000
+```
+
+Inspect the statistics again:
+
+```sql
+SELECT
+    clock_timestamp() AS checked_at,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'vacuum_demo';
+```
+
+At `2026-10-28 19:27:22.775835+00`, the observed result was:
+
+```text
+n_live_tup       | 8000
+n_dead_tup       | 0
+n_mod_since_analyze | 0
+last_autovacuum  | 2026-10-28 19:26:58.952915+00
+autovacuum_count | 5
+```
+
+This confirmed that an additional automatic vacuum had been recorded and the dead-tuple estimate returned to zero. Because autovacuum can run between observations, the statistics do not prove precisely which update triggered it.
+
+### 8.6 Check for an active vacuum worker
+
+```sql
+SELECT
+    p.pid,
+    p.datname,
+    p.relid::regclass AS table_name,
+    p.phase,
+    p.heap_blks_total,
+    p.heap_blks_scanned,
+    p.heap_blks_vacuumed
+FROM pg_stat_progress_vacuum AS p
+WHERE p.datname = 'vacuum_practice'
+  AND p.relid = 'public.vacuum_demo'::regclass;
+```
+
+Observed result:
+
+```text
+(0 rows)
+```
+
+**Interpretation:** No vacuum operation for this table was visible at that moment. This is normal if the operation has already completed. It does not mean autovacuum failed.
+
+### 8.7 Final statistics snapshot
+
+```sql
+SELECT
+    schemaname,
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze,
+    vacuum_count,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE schemaname = 'public'
+  AND relname = 'vacuum_demo';
+```
+
+Final observed values:
+
+```text
+n_live_tup       | 8000
+n_dead_tup       | 0
+n_mod_since_analyze | 0
+last_vacuum      | 2026-10-28 18:36:20.784236+00
+last_autovacuum  | 2026-10-28 19:26:58.952915+00
+last_analyze     | 2026-10-28 19:04:16.196575+00
+last_autoanalyze | 2026-10-28 19:26:58.982976+00
+vacuum_count     | 1
+autovacuum_count | 5
+```
+
+**Conclusion:** The exercise observed both automatic vacuum and automatic analyze. The autovacuum count increased from 4 to 5, the last-autovacuum timestamp advanced, and the dead-tuple estimate returned to zero.
+
+---
+
+## Phase 9 — Investigate Transaction Age and Potential Cleanup Blockers
+
+Dead tuples may remain when an old transaction or snapshot still needs to see an earlier row version. A DBA should investigate long-running transactions before assuming vacuum settings are the only problem.
+
+### 9.1 Inspect active transactions
+
+```sql
+SELECT
+    pid,
+    usename,
+    datname,
+    state,
+    xact_start,
+    clock_timestamp() - xact_start AS transaction_age,
+    backend_xmin,
+    age(backend_xmin) AS backend_xmin_age,
+    left(query, 120) AS query
+FROM pg_stat_activity
+WHERE datname = 'vacuum_practice'
+  AND pid <> pg_backend_pid()
+ORDER BY xact_start NULLS LAST;
+```
+
+**What to look for:**
+
+- Old `xact_start` timestamps.
+- Sessions that remain `idle in transaction`.
+- Old `backend_xmin` values.
+- Transactions that may prevent cleanup of obsolete row versions.
+
+No old-snapshot evidence was observed in the exercise. A query returning no rows means there were no other matching sessions in the result, not that the entire PostgreSQL cluster has no long-running transactions.
+
+### 9.2 Check database transaction ID age
+
+```sql
+SELECT
+    datname,
+    age(datfrozenxid) AS xid_age,
+    current_setting('autovacuum_freeze_max_age') AS freeze_max_age,
+    ROUND(
+        100.0 * age(datfrozenxid)
+        / current_setting('autovacuum_freeze_max_age')::numeric,
+        2
+    ) AS percent_of_freeze_max_age
+FROM pg_database
+ORDER BY age(datfrozenxid) DESC;
+```
+
+The exercise observed an XID age of approximately 293,504 for the databases, with `autovacuum_freeze_max_age` at 200,000,000, or approximately 0.15% of the limit.
+
+**What to look for:** A rapidly increasing XID age or a high percentage of the freeze limit warrants investigation. Do not wait until transaction ID wraparound becomes imminent.
+
+### 9.3 Check the table's frozen XID age
+
+`relfrozenxid` is a column in `pg_class`, not `pg_stat_user_tables`, so join the catalogs:
+
+```sql
+SELECT
+    n.nspname AS schema_name,
+    c.relname,
+    age(c.relfrozenxid) AS xid_age,
+    s.n_live_tup,
+    s.n_dead_tup,
+    s.last_vacuum,
+    s.last_autovacuum
+FROM pg_class AS c
+JOIN pg_namespace AS n
+    ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables AS s
+    ON s.relid = c.oid
+WHERE n.nspname = 'public'
+  AND c.relname = 'vacuum_demo';
+```
+
+The exercise observed a table XID age of approximately 1,614.
+
+**What to look for:** Compare XID age with the freeze threshold and examine whether vacuum is keeping up. XID age is a separate maintenance concern from the current dead-tuple estimate.
+
+---
+
+## Phase 10 — Production DBA Autovacuum Troubleshooting Checklist
+
+When a production table appears to have an autovacuum issue, investigate in this order.
+
+### 10.1 Confirm the table and statistics
+
+```sql
+SELECT
+    schemaname,
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE schemaname = 'public'
+  AND relname = 'your_table_name';
+```
+
+Replace `your_table_name` with the actual table under investigation.
+
+Look for a rising dead-tuple estimate, an old last-autovacuum timestamp, and a growing count of modifications. None of these alone proves a failure.
+
+### 10.2 Inspect effective settings
+
+```sql
+SELECT
+    name,
+    setting,
+    unit,
+    source
+FROM pg_settings
+WHERE name LIKE 'autovacuum%'
+ORDER BY name;
+```
+
+Check whether autovacuum is enabled and whether threshold, scale factor, worker, and cost settings are appropriate.
+
+### 10.3 Check table-specific overrides
+
+```sql
+SELECT
+    n.nspname,
+    c.relname,
+    c.reloptions
+FROM pg_class AS c
+JOIN pg_namespace AS n
+    ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'm')
+  AND c.reloptions IS NOT NULL
+ORDER BY n.nspname, c.relname;
+```
+
+Look for per-table settings that differ from global defaults.
+
+### 10.4 Check active vacuum operations
+
+```sql
+SELECT
+    pid,
+    datname,
+    relid::regclass AS table_name,
+    phase,
+    heap_blks_total,
+    heap_blks_scanned,
+    heap_blks_vacuumed
+FROM pg_stat_progress_vacuum
+ORDER BY datname, table_name;
+```
+
+An empty result means no vacuum operation was visible at that instant.
+
+### 10.5 Check long-running transactions
+
+Use the `pg_stat_activity` query from Phase 9.1. Investigate old transactions and snapshots that might prevent cleanup.
+
+### 10.6 Check transaction ID age
+
+Use the database and table XID age queries from Phase 9. Review freeze-related risk separately from ordinary dead-tuple cleanup.
+
+### 10.7 Review PostgreSQL logs
+
+Inspect the server logs using the system's configured PostgreSQL logging destination. Look for autovacuum cancellations, worker availability issues, permission problems, errors, and long-running vacuum operations.
+
+### 10.8 Tune only when supported by evidence
+
+For a frequently updated table, a lower per-table scale factor may be appropriate. Test changes on a dedicated practice table first, monitor the results, and document the previous values so the settings can be restored.
+
+Do not change global autovacuum settings or disable autovacuum merely because one table has accumulated dead tuples.
+
+---
+
+## Key Lessons
+
+1. **MVCC creates obsolete row versions.** Updates and deletes can create dead tuples that vacuum must eventually clean up.
+2. **Vacuum and analyze serve different purposes.** Vacuum handles dead-tuple cleanup and related maintenance; analyze refreshes planner statistics.
+3. **Autovacuum thresholds are estimates.** The default vacuum trigger is approximately the base threshold plus the scale factor multiplied by the estimated live-row count.
+4. **Eligibility does not mean immediate execution.** Scheduling, worker availability, and other conditions affect when maintenance occurs.
+5. **Statistics are not exact counts.** `n_live_tup`, `n_dead_tup`, and related fields can lag behind recent activity.
+6. **Long-running transactions matter.** Old snapshots can prevent cleanup of tuples that are still potentially visible.
+7. **Freeze maintenance is a separate concern.** Monitor transaction ID age even when dead-tuple estimates are low.
+8. **Indexes require evidence-based tuning.** Use `EXPLAIN (ANALYZE, BUFFERS)` to inspect actual execution behavior rather than assuming every index improves performance.
+9. **Table-level tuning should be deliberate.** Overrides are useful for exceptional workloads, but must be verified and documented.
+10. **Always confirm the scope.** Keep practice updates and deletes inside `vacuum_practice`; do not use production data to reproduce this exercise.
+
+## Project Completion Summary
+
+This exercise demonstrated how to create and modify a PostgreSQL practice table, observe dead tuples, run manual maintenance, examine index plans, calculate autovacuum thresholds, inspect table-level settings, and confirm automatic vacuum and autoanalyze activity.
+
+The final observed table statistics were 8,000 estimated live tuples, zero estimated dead tuples, one recorded manual vacuum, and five recorded autovacuum operations. The table-specific vacuum overrides were removed at the end, restoring inheritance from global settings.
+
+**Status:** Autovacuum troubleshooting exercise completed successfully in `vacuum_practice`.
