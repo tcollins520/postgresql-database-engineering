@@ -4,9 +4,8 @@
 
 This project demonstrates practical PostgreSQL DBA skills using PostgreSQL 18.6 on CentOS Stream 9.
 
-The objective was to understand how PostgreSQL manages dead tuples, how autovacuum thresholds are calculated, how to monitor automatic maintenance, and how to interpret table statistics during a controlled troubleshooting exercise.
+The objective is to understand how PostgreSQL manages dead tuples, how autovacuum thresholds are calculated, how to monitor automatic maintenance, and how to interpret table statistics during a controlled troubleshooting exercise.
 
-The work was performed in a dedicated database named `vacuum_practice`, using the table `public.vacuum_demo`.
 
 ### Objectives
 
@@ -44,16 +43,6 @@ The work was performed in a dedicated database named `vacuum_practice`, using th
 ---
 
 ## Phase 1 — Create the Practice Database and Table
-
-### 1.1 Connect to PostgreSQL
-
-Connect to the PostgreSQL primary using the normal administrative connection method.
-
-From a shell, a local connection as the `postgres` operating-system user can be made with:
-
-```bash
-sudo -iu postgres psql
-```
 
 Create the dedicated practice database if it does not already exist:
 
