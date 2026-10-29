@@ -2,7 +2,6 @@
 
 ## Project Overview
 
-This project demonstrates practical PostgreSQL DBA skills using PostgreSQL 18.6 on CentOS Stream 9.
 
 The objective is to understand how PostgreSQL manages dead tuples, how autovacuum thresholds are calculated, how to monitor automatic maintenance, and how to interpret table statistics during a controlled troubleshooting exercise.
 
